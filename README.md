@@ -1,73 +1,86 @@
-# RAG on a Budget 🚀
+# RAG on a Budget
 
-This project demonstrates a lightweight and cost-effective Retrieval-Augmented Generation (RAG) system using:
+A small retrieval-augmented generation (RAG) setup on AWS. A question comes in through API Gateway, a Lambda function embeds it with Amazon Titan, finds the closest documents in OpenSearch, and asks Claude on Bedrock to answer using those documents.
 
-- **Amazon Titan Text Embeddings V2** for embeddings
-- **OpenSearch Serverless** for vector search
-- **Anthropic Claude** for final answer generation
-- **AWS Lambda** for inference logic
-- **API Gateway** to expose the RAG system as a public API
-- **Terraform** for infrastructure management
+Written up in [Building RAG on a Budget Using AWS Lambda, Bedrock & OpenSearch](https://amruteng.medium.com/building-rag-on-a-budget-using-aws-lambda-bedrock-opensearch-1f17d46b7b17).
 
----
+## How it works
 
-## Project Structure
+- **Embeddings:** Amazon Titan Text Embeddings V2 (`amazon.titan-embed-text-v2:0`), 1024 dimensions
+- **Vector search:** an OpenSearch domain with one `t3.small.search` node and a 10 GB volume, using a k-NN index called `documents`
+- **Answers:** Claude 2.1 on Bedrock (`anthropic.claude-v2:1`), using the top 3 matching documents as context
+- **API:** API Gateway HTTP API, `POST /query`
+- **Infrastructure:** Terraform
+
+The "budget" part is the single small OpenSearch node instead of OpenSearch Serverless, whose minimum capacity costs far more. A `t3.small.search` node is also covered by the AWS free tier on new accounts.
+
+## What's in the repo
 
 ```
 .
 ├── lambda/
-│   └── handler.py              # Main Lambda function for end-to-end RAG
+│   └── handler.py           # embeds the question, searches OpenSearch, calls Claude
 ├── scripts/
-│   ├── create_index.py         # Creates index in OpenSearch with vector mapping
-│   └── embed_documents.py      # Embeds and indexes sample documents
-├── terraform/
-│   └── main.tf                 # Infrastructure: Lambda, API Gateway, OpenSearch, S3
-└── README.md                   # You are here
+│   ├── create_index.py      # creates the k-NN index
+│   ├── embed_documents.py   # embeds and indexes three sample documents
+│   ├── delete.py            # deletes the index (set the endpoint in the file first)
+│   └── sanity.py            # checks that Titan embeddings work from your machine
+└── terraform/
+    ├── main.tf              # S3 bucket, Lambda, IAM role, OpenSearch domain, API Gateway
+    ├── variables.tf
+    ├── rag-lambda.zip       # prebuilt Lambda package: handler.py plus requests and requests_aws4auth
+    └── ...
 ```
 
----
+Terraform deploys `rag-lambda.zip` as committed. If you change `handler.py`, rebuild the zip with the handler and its dependencies before applying.
 
-## 🧪 Setup Instructions
+## Before you deploy
 
-### 1. Clone and Configure
-```bash
-git clone https://github.com/<your-username>/rag-on-a-budget.git
-cd rag-on-a-budget
-```
+A few values in `terraform/main.tf` are specific to my account. Change them first:
 
-### 2. Set Environment Variables
+- The S3 bucket name, `rag-lambda-artifacts`. Bucket names are global, so this one is taken.
+- The OpenSearch access policy allows an IAM user called `iamadmin`. Replace it with a user or role in your account, or remove it.
 
-```bash
-export REGION=us-east-1
-export OPENSEARCH=<your-opensearch-endpoint>
-export AWS_PROFILE=<your-aws-profile>
-```
+You also need Bedrock model access for Titan Text Embeddings V2 and Claude 2.1 in your region.
 
-### 3. Create OpenSearch Index
+## Deploy
 
-```bash
-python scripts/create_index.py
-```
-
-### 4. Embed Documents
-
-```bash
-python scripts/embed_documents.py
-```
-
-### 5. Deploy Lambda using Terraform
+The Lambda needs the OpenSearch endpoint, but Terraform is what creates the domain, so the first deploy takes two applies.
 
 ```bash
 cd terraform
 terraform init
-terraform apply
+
+# 1. Create everything. The endpoint isn't known yet, so pass a placeholder.
+#    The OpenSearch domain takes 15 to 20 minutes.
+terraform apply \
+  -var "opensearch_master_user_arn=<your IAM user or role ARN>" \
+  -var "opensearch_endpoint=https://placeholder"
+
+# 2. Get the real endpoint and apply again so the Lambda gets it.
+ENDPOINT="https://$(aws opensearch describe-domain --domain-name rag-opensearch \
+  --query 'DomainStatus.Endpoint' --output text)"
+terraform apply \
+  -var "opensearch_master_user_arn=<your IAM user or role ARN>" \
+  -var "opensearch_endpoint=$ENDPOINT"
 ```
 
-This zips the handler, installs required Python packages (like `requests` and `requests_aws4auth`), uploads to S3, and deploys the Lambda function with correct IAM role and API Gateway setup.
+The domain has fine-grained access control turned on, so the Lambda's role, `rag_lambda_exec_role`, also has to be mapped to an OpenSearch role (for example `all_access`) in OpenSearch Dashboards under Security, Roles. Without that, searches return 403.
 
----
+Then create the index and load the sample documents, using the same AWS profile as the master user:
 
-## 📡 Example cURL Request
+```bash
+export REGION=us-east-1
+export OPENSEARCH="$ENDPOINT"
+export AWS_PROFILE=<your profile>
+
+python scripts/create_index.py
+python scripts/embed_documents.py
+```
+
+The scripts need `boto3`, `requests` and `requests-aws4auth`.
+
+## Asking a question
 
 ```bash
 curl -X POST https://<api-id>.execute-api.us-east-1.amazonaws.com/query \
@@ -75,35 +88,29 @@ curl -X POST https://<api-id>.execute-api.us-east-1.amazonaws.com/query \
   -d '{"query": "What is OpenSearch?"}'
 ```
 
----
+The response is `{"answer": "..."}`.
 
-## 🧯 Known Issues and Troubleshooting
+## Troubleshooting
 
-| Issue | Description | Fix |
-|-------|-------------|------|
-| `403 Forbidden` from OpenSearch | IAM role missing `es:*` permissions or role not mapped in OpenSearch | Update `access_policies` and map role in OpenSearch |
-| `AccessDeniedException` from Bedrock | Lambda role missing access to model | Add inline policy with `bedrock:InvokeModel` |
-| Vector dimension mismatch (`1024` vs `1536`) | Titan V2 supports multiple sizes; mismatch causes search error | Ensure consistent embedding size and index dimension |
-| `No module named 'requests'` in Lambda | Python packages not bundled | Use Terraform to install dependencies and zip |
-| `Claude prompt` error | Claude requires `Human:` in prompt | Format prompt accordingly |
+| Problem | Cause and fix |
+| --- | --- |
+| `403 Forbidden` from OpenSearch | The caller isn't in the domain's access policy, or the Lambda role isn't mapped to an OpenSearch role. |
+| `AccessDeniedException` from Bedrock | Model access isn't enabled for Titan or Claude in that region. |
+| Vector dimension mismatch | The index is 1024 dimensions, Titan V2's default. Embeddings of another size won't match. |
+| `No module named 'requests'` in Lambda | The deployed zip is missing dependencies. Rebuild `rag-lambda.zip` with them. |
+| Claude rejects the prompt | Claude 2.1's text-completion API needs the `Human:` / `Assistant:` format the handler uses. |
 
----
+Claude 2.1 is an old model. Moving to a current Claude model means switching the handler to Bedrock's Messages API.
 
-## 🧠 Why both Titan and Claude?
-
-- Titan V2 is used for generating embeddings.
-- Claude is used for generating answers based on retrieved context.
-
----
-
-## 🧼 Clean Up
+## Clean up
 
 ```bash
-terraform destroy
+cd terraform
+terraform destroy \
+  -var "opensearch_master_user_arn=<your IAM user or role ARN>" \
+  -var "opensearch_endpoint=$ENDPOINT"
 ```
 
----
-
-## 📜 License
+## License
 
 MIT
